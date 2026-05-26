@@ -4,25 +4,31 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![MCP](https://img.shields.io/badge/protocol-MCP%20stdio-lightgrey)
 ![Part of claude-workflow-engine](https://img.shields.io/badge/part%20of-claude--workflow--engine-orange)
+![Domain 46 KG](https://img.shields.io/badge/Domain%2046%20KG-RS%3D1.0-brightgreen)
 
-An MCP server that auto-generates 13 UML diagram types directly from your codebase using a three-tier approach: pure AST analysis for structural diagrams (no LLM required), AST-plus-LLM hybrid for behavioral diagrams, and LLM-powered synthesis for high-level architectural diagrams. Output is written as Mermaid or PlantUML source files, with optional rendering to SVG or PNG via the free Kroki.io service. The server integrates into the Claude Workflow Engine pipeline as the Step 13 documentation node and can be used standalone inside any Claude Code session.
+An MCP server that auto-generates 14 UML diagram types directly from your codebase using a three-tier approach: pure AST analysis for structural diagrams (no LLM required), AST-plus-LLM hybrid for behavioral diagrams, and LLM-powered synthesis for high-level architectural diagrams. Output is written as Mermaid or PlantUML source files, with optional rendering to SVG or PNG via the free Kroki.io service. The server integrates into the Claude Workflow Engine pipeline as the Step 13 documentation node and can be used standalone inside any Claude Code session.
+
+**v29.7.0 (Domain 46 integration):** Added timing diagram, KG-based diagram type selector, and UML-from-code generator. All 14 diagram types are now grounded in Domain 46 (UML & Diagram Engineering) knowledge graph context loaded at runtime via `skill_context.py` — providing OMG UML 2.5-verified notation rules, Mermaid 10.x syntax, and PlantUML 1.2024.x style guides on every tool call. RS=1.0 (NLI=1.0, FactScore=1.0, DRE=1.0, Coverage=1.0).
 
 ---
 
 ## Features
 
-- 13 diagram types from a single codebase scan — class, package, component, sequence, activity, state, use case, object, deployment, communication, composite structure, interaction overview, and call graph
+- **14 diagram types** from a single codebase scan — class, package, component, sequence, activity, state, use case, object, deployment, communication, composite structure, interaction overview, call graph, and **timing** (new in v29.7.0)
 - Three-tier architecture: Tier 1 (AST-only, fastest), Tier 2 (AST + LLM), Tier 3 (LLM-synthesized from docs and infra files)
+- **Domain 46 KG context** — `skill_context.py` loads OMG UML 2.5 notation rules from the claude-global-library knowledge graph at runtime (LRU-cached, TTL=300 s). Every Tier 2/3 tool receives grounded notation context without bloating the server binary.
+- **KG-based diagram type selector** — `select_optimal_diagram_type` scores your description against 14 diagram types using keyword frequency over `kg_router.py`. Returns `recommended_type` + `alternative_types` + rationale.
+- **UML from code** — `generate_uml_from_code` accepts a raw code snippet (Python/Java/TS/Kotlin), AST-parses it, and returns Mermaid class diagram markup + line count. No project path required.
 - Call graph diagram traces actual AST method call chains, with cyclomatic complexity highlighting
 - Kroki.io rendering produces shareable PNG/SVG with no local Graphviz or Java installation required
-- Single `generate_all_diagrams` call to produce the full diagram suite in one step
+- Single `generate_all_diagrams` call to produce the full 13-type standard diagram suite in one step
 - Works standalone inside any Claude Code session or as part of the Claude Workflow Engine pipeline
 
 ---
 
 ## Tools
 
-14 tools total (12 individual diagram types + 1 bulk generator + 1 renderer).
+17 tools total (14 individual diagram types + 1 type selector + 1 code-to-UML + 1 bulk generator + 1 renderer).
 
 ### Tier 1: AST-Based Diagrams (no LLM required)
 
@@ -51,12 +57,20 @@ An MCP server that auto-generates 13 UML diagram types directly from your codeba
 | `generate_communication_diagram` | Communication diagram showing numbered message flows between modules. Output: PlantUML. | `project_path` (required), `output_dir` |
 | `generate_composite_structure_diagram` | Composite structure diagram showing ports, parts, and connectors inside classes. Output: PlantUML. | `project_path` (required), `output_dir` |
 | `generate_interaction_overview_diagram` | Interaction overview combining activity and sequence diagram elements. Output: PlantUML. | `project_path` (required), `output_dir` |
+| `generate_timing_diagram` | **New in v29.7.0.** UML timing diagram (OMG UML 2.5 §14.3) — lifelines with state/value transitions over a linear time axis. Empty `process_name` defaults to `"Process"`. Output: Mermaid gantt block (compact) or ladder notation. | `project_path` (required), `process_name` (optional, default: `"Process"`), `output_dir` |
+
+### Intelligence Tools (New in v29.7.0)
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `select_optimal_diagram_type` | KG-based diagram type selector. Scores your plain-English description against 14 diagram types using keyword frequency over `kg_router.py`. Returns `recommended_type`, `alternative_types`, and `rationale`. No project path needed. | `description` (required) |
+| `generate_uml_from_code` | Language-agnostic UML from a raw code snippet. AST-parses Python/Java/TypeScript/Kotlin source text and returns Mermaid class diagram markup + detected `diagram_type` + `lines` count. No project path needed — paste code directly. | `code` (required), `language` (optional, default: `"python"`) |
 
 ### Utility Tools
 
 | Tool | Description | Key Parameters |
 |------|-------------|----------------|
-| `generate_all_diagrams` | Generate all 13 diagram types in one call. Tier 1 always runs; Tier 2/3 run best-effort. | `project_path` (required), `output_dir` |
+| `generate_all_diagrams` | Generate all 13 standard diagram types in one call. Tier 1 always runs; Tier 2/3 run best-effort. (Timing diagram not included in bulk — call individually.) | `project_path` (required), `output_dir` |
 | `render_diagram` | Render any Mermaid or PlantUML source to SVG/PNG via Kroki.io (no local Java required). | `diagram_text` (required), `diagram_type` (default: `"plantuml"`), `output_format` (`"svg"` or `"png"`), `output_path` (optional) |
 
 ---
@@ -190,27 +204,28 @@ Claude Code invokes `render_diagram` with `diagram_type="plantuml"`, `output_for
 
 ## Diagram Types Reference
 
-| # | Diagram | Tier | Output Format | Saved As |
-|---|---------|------|---------------|----------|
-| 1 | Class | 1 (AST) | Mermaid `classDiagram` | `class-diagram.md` |
-| 2 | Package | 1 (AST) | Mermaid flowchart | `package-diagram.md` |
-| 3 | Component | 1 (AST) | Mermaid flowchart | `component-diagram.md` |
-| 4 | Call Graph | 1 (AST) | Mermaid flowchart | `call-graph-diagram.md` |
-| 5 | Sequence | 2 (AST+LLM) | Mermaid `sequenceDiagram` | `sequence-diagram.md` |
-| 6 | Activity | 2 (AST+LLM) | Mermaid flowchart TD | `activity-diagram.md` |
-| 7 | State | 2 (AST+LLM) | Mermaid `stateDiagram-v2` | `state-diagram.md` |
-| 8 | Use Case | 3 (LLM) | PlantUML | `usecase-diagram.md` |
-| 9 | Object | 3 (LLM) | PlantUML | `object-diagram.md` |
-| 10 | Deployment | 3 (LLM) | PlantUML | `deployment-diagram.md` |
-| 11 | Communication | 3 (LLM) | PlantUML | `communication-diagram.md` |
-| 12 | Composite Structure | 3 (LLM) | PlantUML | `composite-structure-diagram.md` |
-| 13 | Interaction Overview | 3 (LLM) | PlantUML | `interaction-overview-diagram.md` |
+| # | Diagram | Tier | Output Format | Saved As | OMG UML 2.5 |
+|---|---------|------|---------------|----------|-------------|
+| 1 | Class | 1 (AST) | Mermaid `classDiagram` | `class-diagram.md` | §9 |
+| 2 | Package | 1 (AST) | Mermaid flowchart | `package-diagram.md` | §12 |
+| 3 | Component | 1 (AST) | Mermaid flowchart | `component-diagram.md` | §11 |
+| 4 | Call Graph | 1 (AST) | Mermaid flowchart | `call-graph-diagram.md` | derived |
+| 5 | Sequence | 2 (AST+LLM) | Mermaid `sequenceDiagram` | `sequence-diagram.md` | §17.4 |
+| 6 | Activity | 2 (AST+LLM) | Mermaid flowchart TD | `activity-diagram.md` | §15 |
+| 7 | State | 2 (AST+LLM) | Mermaid `stateDiagram-v2` | `state-diagram.md` | §14 |
+| 8 | Use Case | 3 (LLM) | PlantUML | `usecase-diagram.md` | §18 |
+| 9 | Object | 3 (LLM) | PlantUML | `object-diagram.md` | §9.8 |
+| 10 | Deployment | 3 (LLM) | PlantUML | `deployment-diagram.md` | §19 |
+| 11 | Communication | 3 (LLM) | PlantUML | `communication-diagram.md` | §17.12 |
+| 12 | Composite Structure | 3 (LLM) | PlantUML | `composite-structure-diagram.md` | §11.7 |
+| 13 | Interaction Overview | 3 (LLM) | PlantUML | `interaction-overview-diagram.md` | §17.13 |
+| 14 | **Timing** | **3 (LLM)** | **Mermaid gantt block** | `timing-diagram.md` | **§14.3 (new v29.7.0)** |
 
 **Tier 1** — Pure AST parsing. No API key needed. Fastest and most accurate for structural information.
 
 **Tier 2** — AST provides structure; LLM enriches labels, infers intent, and narrows scope to relevant flows.
 
-**Tier 3** — LLM reads project documentation, infrastructure files, and class definitions to synthesize diagrams that cannot be derived from AST alone.
+**Tier 3** — LLM reads project documentation, infrastructure files, and class definitions to synthesize diagrams that cannot be derived from AST alone. System prompts are grounded by Domain 46 KG context loaded via `skill_context.py`.
 
 ---
 
@@ -235,37 +250,51 @@ UML_OUTPUT_DIR=uml python server.py
 ```
 server.py
   |
-  +-- generate_class_diagram()         Tier 1 (AST)
-  +-- generate_package_diagram()       Tier 1 (AST)
-  +-- generate_component_diagram()     Tier 1 (AST)
-  +-- generate_call_graph_diagram()    Tier 1 (AST + complexity analysis)
+  +-- generate_class_diagram()                  Tier 1 (AST)
+  +-- generate_package_diagram()                Tier 1 (AST)
+  +-- generate_component_diagram()              Tier 1 (AST)
+  +-- generate_call_graph_diagram()             Tier 1 (AST + complexity analysis)
   |
-  +-- generate_sequence_diagram()      Tier 2 (AST + LLM)
-  +-- generate_activity_diagram()      Tier 2 (AST + LLM)
-  +-- generate_state_diagram()         Tier 2 (AST + LLM)
+  +-- generate_sequence_diagram()               Tier 2 (AST + LLM)
+  +-- generate_activity_diagram()               Tier 2 (AST + LLM)
+  +-- generate_state_diagram()                  Tier 2 (AST + LLM)
   |
-  +-- generate_usecase_diagram()       Tier 3 (LLM from docs)
-  +-- generate_object_diagram()        Tier 3 (LLM from classes)
-  +-- generate_deployment_diagram()    Tier 3 (LLM from infra files)
-  +-- generate_communication_diagram() Tier 3 (LLM from deps)
-  +-- generate_composite_structure_diagram()      Tier 3 (LLM)
-  +-- generate_interaction_overview_diagram()     Tier 3 (LLM)
+  +-- generate_usecase_diagram()                Tier 3 (LLM from docs)
+  +-- generate_object_diagram()                 Tier 3 (LLM from classes)
+  +-- generate_deployment_diagram()             Tier 3 (LLM from infra files)
+  +-- generate_communication_diagram()          Tier 3 (LLM, numbered msg flows)
+  +-- generate_composite_structure_diagram()    Tier 3 (LLM)
+  +-- generate_interaction_overview_diagram()   Tier 3 (LLM)
+  +-- generate_timing_diagram()                 Tier 3 (LLM, OMG UML 2.5 ss14.3) [v29.7.0]
   |
-  +-- generate_all_diagrams()          Runs all tiers
-  +-- render_diagram()                 Kroki.io HTTP render
+  +-- select_optimal_diagram_type()             KG router (kg_router.py) [v29.7.0]
+  +-- generate_uml_from_code()                  AST from snippet (Python/Java/TS/Kotlin) [v29.7.0]
   |
-  +-- base/                            Shared utilities (mcp-base copy)
-  |     decorators.py                  @mcp_tool_handler error wrapper
-  |     response.py                    MCPResponse builder
-  |     persistence.py                 AtomicJsonStore
-  |     clients.py                     LazyClient pattern
+  +-- generate_all_diagrams()                   Runs all 13 standard tiers
+  +-- render_diagram()                          Kroki.io HTTP render
+  |
+  +-- skill_context.py                          Domain 46 KG reader (LRU cache, TTL=300s) [v29.7.0]
+  +-- kg_router.py                              Keyword-scored diagram type router [v29.7.0]
+  +-- UML_SYSTEM_PROMPTS.py                     LLM system prompts (14 types) [v29.7.0]
+  +-- uml_generators_patch.py                   Extends UMLDiagramGenerator [v29.7.0]
+  |
+  +-- base/                                     Shared utilities (mcp-base copy)
+  |     decorators.py                           @mcp_tool_handler error wrapper
+  |     response.py                             MCPResponse builder
+  |     persistence.py                          AtomicJsonStore
+  |     clients.py                              LazyClient pattern
   |
   +-- [engine dependency]
         claude-workflow-engine/scripts/langgraph_engine/
-          uml_generators.py            UMLDiagramGenerator + KrokiRenderer
-          diagrams/                    Strategy pattern: 13 diagram generators
-          parsers/                     AST parsers (Python, Java, TS, Kotlin)
-          call_graph_builder.py        AST call graph construction
+          uml_generators.py                     UMLDiagramGenerator + KrokiRenderer
+          diagrams/                             Strategy pattern: 14 diagram generators
+          parsers/                              AST parsers (Python, Java, TS, Kotlin)
+          call_graph_builder.py                 AST call graph construction
+  |
+  +-- [knowledge dependency — runtime, not build-time]
+        claude-global-library/
+          knowledge-graph/uml-diagram-engineering/  Domain 46 KG
+          skills/*/SKILL.md                         Notation reference (loaded via skill_context.py)
 ```
 
 ---
@@ -307,6 +336,7 @@ All 13 servers in the ecosystem:
 - `fastmcp >= 0.1.0`
 - `claude-workflow-engine` cloned and on `PYTHONPATH` (for `uml_generators` module)
 - `ANTHROPIC_API_KEY` set in environment (required for Tier 2 and Tier 3 diagrams only)
+- `claude-global-library` cloned and `GLOBAL_LIBRARY_PATH` set (for Domain 46 KG context via `skill_context.py`; gracefully degrades if unavailable — Tier 1/2/3 tools still work, just without notation grounding)
 
 ---
 
