@@ -15,6 +15,7 @@ GLOBAL_LIBRARY_PATH = os.environ.get(
 
 _CACHE_TTL_SECONDS = 300.0
 _CACHE = {}  # type: Dict[str, Tuple[Any, float]]
+_SKILL_MAX_BYTES = int(os.environ.get("SKILL_MAX_BYTES", "524288"))  # 512 KB default
 
 _SKILL_PATH_TEMPLATE = os.path.join("skills", "{name}", "SKILL.md")
 _KG_PATH_TEMPLATE = os.path.join("knowledge-graph", "{domain}", "skills.json")
@@ -162,7 +163,8 @@ def get_skill_context(skill_name):
     def _reader():
         # type: () -> str
         p = Path(safe_path)
-        return p.read_text(encoding="utf-8", errors="replace")
+        with p.open("r", encoding="utf-8", errors="replace") as fh:
+            return fh.read(_SKILL_MAX_BYTES)
 
     result = _read_cached(cache_key, _reader)
     if result is None:

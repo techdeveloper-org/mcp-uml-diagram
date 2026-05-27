@@ -13,6 +13,9 @@ NEW Utility: select_optimal_diagram_type (KG router)
 Python 3.8+ only. ASCII-only source (cp1252 safe on Windows).
 """
 
+import datetime as _datetime
+import json as _json
+import logging as _logging
 import os
 import sys
 from pathlib import Path
@@ -38,6 +41,10 @@ try:
     _SKILL_CONTEXT_AVAILABLE = True
 except ImportError:
     _SKILL_CONTEXT_AVAILABLE = False
+    _logging.getLogger(__name__).warning(
+        "skill_context not importable. Domain 46 enrichment unavailable. "
+        "Set GLOBAL_LIBRARY_PATH env var to enable."
+    )
 
 try:
     from kg_router import select_diagram_type as _kg_select_diagram_type
@@ -45,12 +52,43 @@ try:
 except ImportError:
     _KG_ROUTER_AVAILABLE = False
 
-if not _SKILL_CONTEXT_AVAILABLE:
-    import logging as _logging
+try:
+    import uml_generators_patch as _uml_patch  # noqa: F401
+    _UML_PATCH_AVAILABLE = True
+except ImportError:
+    _UML_PATCH_AVAILABLE = False
     _logging.getLogger(__name__).warning(
-        "skill_context not importable. Domain 46 enrichment unavailable. "
-        "Set GLOBAL_LIBRARY_PATH env var to enable."
+        "uml_generators_patch not importable. generate_timing_diagram and "
+        "generate_uml_from_code rely on this patch module."
     )
+
+_AUDIT_LOG_ENABLED = os.environ.get("ENABLE_AUDIT_LOG", "0") == "1"
+_AUDIT_LOGGER = _logging.getLogger("uml_diagram.audit")
+
+
+def _audit(tool_name, params):
+    # type: (str, dict) -> None
+    """Log a structured audit entry when ENABLE_AUDIT_LOG=1.
+
+    Emits a single-line JSON record to the uml_diagram.audit logger at INFO
+    level. Suppresses all exceptions silently so audit failures never interrupt
+    tool execution. Set ENABLE_AUDIT_LOG=1 environment variable to activate.
+
+    Args:
+        tool_name: MCP tool name being invoked.
+        params: Dict of sanitized parameter names and scalar values.
+                Must not contain file contents or secrets.
+    """
+    if not _AUDIT_LOG_ENABLED:
+        return
+    try:
+        _AUDIT_LOGGER.info(_json.dumps({
+            "ts": _datetime.datetime.utcnow().isoformat() + "Z",
+            "tool": tool_name,
+            "params": params,
+        }))
+    except Exception:
+        pass
 
 _DIAGRAM_TYPE_TO_SKILL = {
     "class":         "uml-class-diagram-core",
@@ -155,6 +193,7 @@ def generate_class_diagram(
         scope: "all" for full project, or a specific directory/file path.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_class_diagram", {"project_path": project_path, "scope": scope, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_class_diagram(scope=scope)
     path = gen.save_diagram("class-diagram", syntax)
@@ -181,6 +220,7 @@ def generate_package_diagram(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_package_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_package_diagram()
     path = gen.save_diagram("package-diagram", syntax)
@@ -207,6 +247,7 @@ def generate_component_diagram(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_component_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_component_diagram()
     path = gen.save_diagram("component-diagram", syntax)
@@ -239,6 +280,7 @@ def generate_sequence_diagram(
         entry_function: Optional entry function to trace from.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_sequence_diagram", {"project_path": project_path, "entry_function": entry_function, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_sequence_diagram(context=entry_function)
     path = gen.save_diagram("sequence-diagram", syntax)
@@ -266,14 +308,15 @@ def generate_activity_diagram(
         function_path: Optional file:function to analyze (e.g., "src/main.py:run").
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_activity_diagram", {"project_path": project_path, "function_path": function_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
 
     func_code = ""
     if function_path and ":" in function_path:
-        file_part, func_name = function_path.rsplit(":", 1)
-        file_full = Path(project_path) / file_part
-        if file_full.is_file():
-            func_code = file_full.read_text(encoding="utf-8", errors="replace")[:3000]
+        file_part, _func_name = function_path.rsplit(":", 1)
+        resolved_file, _err = _resolve_project_file(project_path, file_part)
+        if resolved_file:
+            func_code = Path(resolved_file).read_text(encoding="utf-8", errors="replace")[:3000]
 
     syntax = gen.generate_activity_diagram(func_code)
     path = gen.save_diagram("activity-diagram", syntax)
@@ -302,6 +345,7 @@ def generate_state_diagram(
         context: Additional context about states in the system.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_state_diagram", {"project_path": project_path, "context": context, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_state_diagram(context=context)
     path = gen.save_diagram("state-diagram", syntax)
@@ -332,6 +376,7 @@ def generate_usecase_diagram(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_usecase_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_usecase_diagram()
     path = gen.save_diagram("usecase-diagram", syntax)
@@ -358,6 +403,7 @@ def generate_object_diagram(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_object_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_object_diagram()
     path = gen.save_diagram("object-diagram", syntax)
@@ -384,6 +430,7 @@ def generate_deployment_diagram(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_deployment_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_deployment_diagram()
     path = gen.save_diagram("deployment-diagram", syntax)
@@ -410,6 +457,7 @@ def generate_communication_diagram(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_communication_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_communication_diagram()
     path = gen.save_diagram("communication-diagram", syntax)
@@ -436,6 +484,7 @@ def generate_composite_structure_diagram(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_composite_structure_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_composite_structure_diagram()
     path = gen.save_diagram("composite-structure-diagram", syntax)
@@ -462,6 +511,7 @@ def generate_interaction_overview_diagram(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_interaction_overview_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_interaction_overview()
     path = gen.save_diagram("interaction-overview-diagram", syntax)
@@ -493,6 +543,7 @@ def generate_call_graph_diagram(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_call_graph_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_call_graph_diagram()
     path = gen.save_diagram("call-graph-diagram", syntax)
@@ -526,6 +577,7 @@ def generate_all_diagrams(
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
     """
+    _audit("generate_all_diagrams", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     results = gen.generate_all()
 
@@ -567,6 +619,7 @@ def render_diagram(
         output_format: "svg" or "png".
         output_path: Optional file path to save rendered output.
     """
+    _audit("render_diagram", {"diagram_type": diagram_type, "output_format": output_format, "output_path": output_path})
     renderer = _get_renderer()
 
     if output_path:
@@ -634,6 +687,7 @@ def generate_uml_from_code(
     Returns:
         dict with diagram_type, format, output_file, language, lines_parsed.
     """
+    _audit("generate_uml_from_code", {"project_path": project_path, "source_file": source_file, "language": language, "output_dir": output_dir})
     resolved, err = _resolve_project_file(project_path, source_file)
     if err:
         return {
@@ -642,7 +696,7 @@ def generate_uml_from_code(
             "output_file": "",
             "error": err,
             "language": language,
-            "lines_parsed": 0,
+            "lines": 0,
         }
 
     try:
@@ -654,7 +708,7 @@ def generate_uml_from_code(
             "output_file": "",
             "error": "Could not read source file: %s" % str(exc),
             "language": language,
-            "lines_parsed": 0,
+            "lines": 0,
         }
 
     lines_parsed = len(source_code.splitlines())
@@ -667,7 +721,7 @@ def generate_uml_from_code(
         "format": "mermaid",
         "output_file": path,
         "language": language,
-        "lines_parsed": lines_parsed,
+        "lines": lines_parsed,
     }
 
 
@@ -699,6 +753,7 @@ def select_optimal_diagram_type(
         dict with diagram_type, reason, confidence (keyword match count),
         available_types (list of all 14 slugs), available (bool).
     """
+    _audit("select_optimal_diagram_type", {"project_description": project_description[:100], "constraint": constraint})
     if "\x00" in project_description or "\x00" in constraint:
         return {
             "diagram_type": "class",
@@ -779,13 +834,14 @@ def generate_timing_diagram(
         project_path: Root path of the project to analyze.
         process_name: Name of the process for the gantt title.
                       Max 200 characters. Defaults to "" (rendered as
-                      "System Process Timeline").
+                      "Process").
         output_dir: Output directory relative to project root.
                     Defaults to "docs/uml".
 
     Returns:
         dict with diagram_type, format, output_file, lines, process_name.
     """
+    _audit("generate_timing_diagram", {"project_path": project_path, "process_name": process_name, "output_dir": output_dir})
     if len(process_name) > 200:
         process_name = process_name[:200]
 
@@ -798,7 +854,7 @@ def generate_timing_diagram(
         "format": "mermaid",
         "output_file": path,
         "lines": len(syntax.split("\n")),
-        "process_name": process_name if process_name else "System Process Timeline",
+        "process_name": process_name if process_name else "Process",
     }
 
 
