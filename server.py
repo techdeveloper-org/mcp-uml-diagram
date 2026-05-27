@@ -685,7 +685,7 @@ def generate_uml_from_code(
                     Defaults to "docs/uml".
 
     Returns:
-        dict with diagram_type, format, output_file, language, lines_parsed.
+        dict with diagram_type, format, output_file, language, lines.
     """
     _audit("generate_uml_from_code", {"project_path": project_path, "source_file": source_file, "language": language, "output_dir": output_dir})
     resolved, err = _resolve_project_file(project_path, source_file)
