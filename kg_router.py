@@ -1,6 +1,6 @@
 # kg_router.py
 # Keyword-based UML diagram type selector for Domain 46 MCP integration.
-# Compatible: Python 3.8+, stdlib only, ASCII encoding safe (cp1252 compliant).
+# Compatible: Python 3.11+, stdlib only, ASCII encoding safe (cp1252 compliant).
 # Place at: mcp-uml-diagram/kg_router.py  OR  mcp-drawio-diagram/kg_router.py
 import os
 from typing import Dict, List, Tuple

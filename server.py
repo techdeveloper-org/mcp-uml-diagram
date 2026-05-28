@@ -10,7 +10,7 @@ NEW Tier 2: generate_timing_diagram (LLM gantt)
 NEW Utility: select_optimal_diagram_type (KG router)
 
 17 tools total (14 diagram types + generate_all + render + select_optimal_diagram_type).
-Python 3.8+ only. ASCII-only source (cp1252 safe on Windows).
+Python 3.11+. ASCII-only source (cp1252 safe on Windows).
 """
 
 import datetime as _datetime

@@ -1,6 +1,6 @@
 # mcp-uml-diagram
 
-![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![MCP](https://img.shields.io/badge/protocol-MCP%20stdio-lightgrey)
 ![Part of claude-workflow-engine](https://img.shields.io/badge/part%20of-claude--workflow--engine-orange)
@@ -331,7 +331,7 @@ All 13 servers in the ecosystem:
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.11+
 - `mcp >= 1.0.0`
 - `fastmcp >= 0.1.0`
 - `claude-workflow-engine` cloned and on `PYTHONPATH` (for `uml_generators` module)

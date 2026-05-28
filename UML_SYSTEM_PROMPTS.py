@@ -6,8 +6,7 @@ context (uml-diagram-engineering). Each constant is a self-contained
 system prompt covering Mermaid 10.x syntax, OMG UML 2.5 notation, and
 the three most common mistakes to avoid.
 
-Python 3.8 compatibility: explicit typing imports, no X|Y union syntax,
-no walrus operator, no match/case.
+Python 3.11+. Typing imports retained for compatibility with pre-migration callers.
 """
 from typing import Any, Dict, List, Optional, Set, Tuple
 

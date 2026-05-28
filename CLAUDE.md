@@ -2,7 +2,7 @@
 
 **Type:** FastMCP Server
 **Transport:** stdio
-**Python:** 3.8+
+**Python:** 3.11+
 
 ---
 
@@ -166,7 +166,7 @@ mcp-uml-diagram/
 3. Keep `server.py` as the single entry point
 4. All tool handlers must use `@mcp_tool_handler` decorator for consistent error handling
 5. All responses must use `success()` / `error()` / `MCPResponse` builder from `base.response`
-6. All new Python files must be Python 3.8+ compatible — no `list[X]`, `dict[K,V]`, `X|Y` unions, walrus `:=`, or `match/case`. Use `from typing import Any, Dict, List, Optional, Set, Tuple`.
+6. Python 3.11+ minimum target. New files may use `list[X]`, `dict[K,V]`, `X|Y` unions. Existing files retain `from typing import ...` imports until a full annotation migration is done (tracked separately). All source files remain ASCII-only (cp1252 safe).
 7. All source files must be ASCII-only (cp1252 safe) — no non-ASCII literals in .py files
 8. `skill_context.py` reads from `GLOBAL_LIBRARY_PATH` — always validate paths via `_safe_join()` before any file I/O
 9. Domain 46 context loaded once per cache TTL (300 s) — do NOT reload on every tool call
@@ -185,12 +185,20 @@ mcp-uml-diagram/
 
 **KG router scoring:** `kg_router.py` uses term-frequency scoring against Domain 46 `math_routing.json`. Produces `recommended_type` + `alternative_types` + `skill_context_available` flag.
 
-**Advisory backlog (next sprint):**
-- SAST-001: add path guard to `generate_activity_diagram` `function_path` parameter (defense-in-depth)
-- Add 512 KB size cap to `skill_context.py` SKILL.md reads
-- Structured audit logging for all tool invocations
-- Upgrade Python 3.8 EOL target to Python 3.11
+**Advisory Sprint 2 (2026-05-27) — COMPLETE:**
+- SAST-001 fixed: `generate_activity_diagram` now uses `_resolve_project_file()` path guard
+- 512 KB SKILL.md read cap: `SKILL_MAX_BYTES` env var added to `skill_context.py`
+- Structured audit logging: `_audit()` + `ENABLE_AUDIT_LOG=1` flag; all 18 tools instrumented
+- Python target upgraded: 3.8+ EOL → 3.11+ (annotation migration deferred, tracked in backlog)
+- `uml_generators_patch.py` import guard: `_UML_PATCH_AVAILABLE` flag + fallback warning
+- `generate_timing_diagram_ladder()`: PlantUML robust/concise ladder notation variant added
+- `_esc()` coverage: attr type_hint, method name, params, return_type now escaped in drawio_converter_enriched
+
+**Remaining deferred (next sprint):**
+- Full annotation migration: replace `from typing import ...` with builtin generics (Python 3.11+)
+- CVE lxml/requests upgrades (lxml>=4.9.4, requests>=2.32.4 when pinned in consumers)
+- `_apply_uml_styles` post-processing implementation (currently a documented stub)
 
 ---
 
-**Last Updated:** 2026-05-26 (Domain 46 UML & Diagram Engineering integration, v29.7.0)
+**Last Updated:** 2026-05-28 (Advisory Sprint 3 — Python 3.11+, ladder notation, _esc() fixes)

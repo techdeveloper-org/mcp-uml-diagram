@@ -1,6 +1,6 @@
 # skill_context.py
 # Skill-aware context loader for Domain 46 UML & Diagram Engineering knowledge.
-# Compatible: Python 3.8+, stdlib only, ASCII encoding safe (cp1252 compliant).
+# Compatible: Python 3.11+, stdlib only, ASCII encoding safe (cp1252 compliant).
 # Place at: mcp-uml-diagram/skill_context.py  OR  mcp-drawio-diagram/skill_context.py
 import json
 import os
