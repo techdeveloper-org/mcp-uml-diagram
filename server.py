@@ -23,10 +23,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mcp.server.fastmcp import FastMCP
+# mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
+# Both names are probed so this server runs under either major version; the
+# API used below (tool decorator, run(transport=...)) is identical in both.
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # mcp < 2.0
+    from mcp.server.fastmcp import FastMCP as MCPServer
 from base.decorators import mcp_tool_handler
 
-mcp = FastMCP(
+mcp = MCPServer(
     "uml-diagram",
     instructions=(
         "UML diagram generation from codebase analysis. "
