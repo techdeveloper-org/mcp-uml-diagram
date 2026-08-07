@@ -14,12 +14,15 @@ Python 3.11+. ASCII-only source (cp1252 safe on Windows).
 """
 
 import datetime as _datetime
+import inspect as _inspect
 import json as _json
 import logging as _logging
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Tuple
+
+from pydantic import Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -30,6 +33,12 @@ try:
     from mcp.server.mcpserver import MCPServer
 except ImportError:  # mcp < 2.0
     from mcp.server.fastmcp import FastMCP as MCPServer
+
+try:
+    from mcp.types import ToolAnnotations
+except ImportError:  # very old SDK without the annotations model
+    ToolAnnotations = None
+
 from base.decorators import mcp_tool_handler
 
 mcp = MCPServer(
@@ -58,18 +67,9 @@ try:
 except ImportError:
     _KG_ROUTER_AVAILABLE = False
 
-try:
-    import uml_generators_patch as _uml_patch  # noqa: F401
-    _UML_PATCH_AVAILABLE = True
-except ImportError:
-    _UML_PATCH_AVAILABLE = False
-    _logging.getLogger(__name__).warning(
-        "uml_generators_patch not importable. generate_timing_diagram and "
-        "generate_uml_from_code rely on this patch module."
-    )
-
 _AUDIT_LOG_ENABLED = os.environ.get("ENABLE_AUDIT_LOG", "0") == "1"
 _AUDIT_LOGGER = _logging.getLogger("uml_diagram.audit")
+_LOG = _logging.getLogger("uml_diagram")
 
 
 def _audit(tool_name, params):
@@ -77,8 +77,9 @@ def _audit(tool_name, params):
     """Log a structured audit entry when ENABLE_AUDIT_LOG=1.
 
     Emits a single-line JSON record to the uml_diagram.audit logger at INFO
-    level. Suppresses all exceptions silently so audit failures never interrupt
-    tool execution. Set ENABLE_AUDIT_LOG=1 environment variable to activate.
+    level. A serialization failure is downgraded to a warning rather than
+    propagating, so audit logging never interrupts tool execution, but it is
+    never silently discarded either. Set ENABLE_AUDIT_LOG=1 to activate.
 
     Args:
         tool_name: MCP tool name being invoked.
@@ -89,12 +90,99 @@ def _audit(tool_name, params):
         return
     try:
         _AUDIT_LOGGER.info(_json.dumps({
-            "ts": _datetime.datetime.utcnow().isoformat() + "Z",
+            "ts": _datetime.datetime.now(_datetime.timezone.utc).isoformat(),
             "tool": tool_name,
             "params": params,
         }))
-    except Exception:
-        pass
+    except (TypeError, ValueError) as exc:
+        _AUDIT_LOGGER.warning(
+            "audit record for %s could not be serialized: %s", tool_name, exc
+        )
+
+
+_TOOL_KWARGS = set(_inspect.signature(mcp.tool).parameters)
+
+
+def _tool(**kwargs):
+    """Register an MCP tool, dropping kwargs the installed SDK does not accept.
+
+    ``annotations`` and ``structured_output`` were added to FastMCP at
+    different points, so unsupported keywords are filtered rather than raising
+    at import time on an older SDK.
+
+    Args:
+        **kwargs: Keyword arguments for the underlying ``mcp.tool`` decorator.
+
+    Returns:
+        The decorator returned by ``mcp.tool``.
+    """
+    supported = {key: value for key, value in kwargs.items() if key in _TOOL_KWARGS}
+    return mcp.tool(**supported)
+
+
+def _annotations(title, read_only, destructive, idempotent, open_world=False):
+    """Build a ``ToolAnnotations`` object, or None on an SDK without the model.
+
+    An omitted annotation set is read by the specification as the least-safe
+    possible declaration, so every tool here declares all four hints.
+
+    Args:
+        title: Human-readable tool title.
+        read_only: True when the tool performs no writes.
+        destructive: True when the tool's effect is irreversible.
+        idempotent: True when repeat calls with identical arguments have the
+            same cumulative effect as a single call.
+        open_world: True when the tool reaches an external or open-ended system.
+
+    Returns:
+        A ``ToolAnnotations`` instance, or None when unavailable.
+    """
+    if ToolAnnotations is None:
+        return None
+    return ToolAnnotations(
+        title=title,
+        readOnlyHint=read_only,
+        destructiveHint=destructive,
+        idempotentHint=idempotent,
+        openWorldHint=open_world,
+    )
+
+
+ProjectPath = Annotated[str, Field(
+    description="Absolute root path of the project to analyze."
+)]
+OutputDir = Annotated[str, Field(
+    description=(
+        "Output directory for the generated Mermaid/PlantUML .md file, relative "
+        "to the project root or absolute. Leave empty to use the UML_OUTPUT_DIR "
+        "environment variable, falling back to '{project_root}/uml'."
+    )
+)]
+
+# Canonical output file stems mandated for the standard diagram set. The engine
+# names its results with hyphens and two longer stems; every write goes through
+# _canonical_stem() so the files on disk carry these exact names.
+_CANONICAL_STEMS = {
+    "class": "class_diagram",
+    "package": "package_diagram",
+    "component": "component_diagram",
+    "sequence": "sequence_diagram",
+    "state": "state_diagram",
+    "activity": "activity_diagram",
+    "deployment": "deployment_diagram",
+    "usecase": "usecase_diagram",
+    "object": "object_diagram",
+    "composite": "composite_diagram",
+    "interaction": "interaction_diagram",
+    "communication": "communication_diagram",
+    "call_graph": "call_graph_diagram",
+}
+
+_ENGINE_STEM_ALIASES = {
+    "composite_structure_diagram": "composite_diagram",
+    "interaction_overview_diagram": "interaction_diagram",
+    "use_case_diagram": "usecase_diagram",
+}
 
 _DIAGRAM_TYPE_TO_SKILL = {
     "class":         "uml-class-diagram-core",
@@ -121,22 +209,120 @@ _ALL_DIAGRAM_TYPE_SLUGS = [
 ]
 
 
-def _get_generator(project_path, output_dir="docs/uml"):
+def _engine_root_candidates():
+    """Return the candidate directories that may contain ``langgraph_engine``.
+
+    Ordered most-specific first: explicit environment overrides, then the
+    sibling claude-workflow-engine checkout (where the package lives at the
+    repository root), then its legacy ``scripts/`` location.
+
+    Returns:
+        List of Path objects, in probe order.
+    """
+    here = Path(__file__).resolve().parent
+    workspace = here.parent
+    candidates = []
+    for var in ("CLAUDE_WORKFLOW_ENGINE_PATH", "WORKFLOW_ENGINE_PATH"):
+        raw = os.environ.get(var, "").strip()
+        if raw:
+            candidates.append(Path(raw))
+            candidates.append(Path(raw) / "scripts")
+    candidates.append(workspace / "claude-workflow-engine")
+    candidates.append(workspace / "claude-workflow-engine" / "scripts")
+    candidates.append(workspace.parent / "scripts")
+    return candidates
+
+
+def _ensure_engine_path():
+    """Put the claude-workflow-engine root on sys.path.
+
+    Only a directory that actually contains ``langgraph_engine/__init__.py`` is
+    added, so a stale or renamed checkout produces an explicit failure instead
+    of a silently ineffective sys.path entry.
+
+    Returns:
+        The Path that was added or already present, or None when no candidate
+        contains the package.
+    """
+    for candidate in _engine_root_candidates():
+        if (candidate / "langgraph_engine" / "__init__.py").is_file():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            return candidate
+    _LOG.warning(
+        "langgraph_engine not found in any known location: %s. "
+        "Set CLAUDE_WORKFLOW_ENGINE_PATH to the claude-workflow-engine checkout.",
+        ", ".join(str(c) for c in _engine_root_candidates()),
+    )
+    return None
+
+
+_ENGINE_ROOT = _ensure_engine_path()
+
+try:
+    import uml_generators_patch as _uml_patch  # noqa: F401
+    _UML_PATCH_AVAILABLE = True
+except ImportError:
+    _UML_PATCH_AVAILABLE = False
+    _LOG.warning(
+        "uml_generators_patch not importable. generate_timing_diagram and "
+        "generate_uml_from_code rely on this patch module."
+    )
+
+
+def _resolve_output_dir(output_dir):
+    """Resolve the diagram output directory per the UML lifecycle rule.
+
+    Precedence is UML_OUTPUT_DIR, then the caller-supplied directory, then the
+    mandated default of ``uml`` beneath the project root. An empty string means
+    "not supplied", which is why the tool defaults are empty rather than a
+    hard-coded path.
+
+    Args:
+        output_dir: Caller-supplied directory, or an empty string.
+
+    Returns:
+        The directory string to hand to the generator.
+    """
+    env_dir = os.environ.get("UML_OUTPUT_DIR", "").strip()
+    return env_dir or (output_dir or "").strip() or "uml"
+
+
+def _canonical_stem(name):
+    """Map an engine diagram name onto its mandated output file stem.
+
+    Args:
+        name: Engine-supplied name such as ``class-diagram`` or a slug such as
+            ``composite``.
+
+    Returns:
+        The canonical snake_case stem, e.g. ``composite_diagram``.
+    """
+    slug = str(name).strip().lower().replace("-", "_")
+    if slug in _CANONICAL_STEMS:
+        return _CANONICAL_STEMS[slug]
+    if slug in _ENGINE_STEM_ALIASES:
+        return _ENGINE_STEM_ALIASES[slug]
+    if not slug.endswith("_diagram"):
+        slug = "%s_diagram" % slug
+    return _ENGINE_STEM_ALIASES.get(slug, slug)
+
+
+def _get_generator(project_path, output_dir=""):
     """Lazy import and create UMLDiagramGenerator.
 
     Args:
         project_path: Root path of the project to analyze.
-        output_dir: Output directory for generated diagram files.
+        output_dir: Output directory for generated diagram files, or an empty
+            string to resolve it from UML_OUTPUT_DIR / the mandated default.
 
     Returns:
         Initialized UMLDiagramGenerator instance.
     """
-    scripts_dir = Path(__file__).resolve().parent.parent.parent / "scripts"
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
+    _ensure_engine_path()
 
     from langgraph_engine.uml_generators import UMLDiagramGenerator
-    return UMLDiagramGenerator(project_path, output_dir)
+    return UMLDiagramGenerator(project_path, _resolve_output_dir(output_dir))
 
 
 def _get_renderer():
@@ -145,9 +331,7 @@ def _get_renderer():
     Returns:
         Initialized KrokiRenderer instance.
     """
-    scripts_dir = Path(__file__).resolve().parent.parent.parent / "scripts"
-    if str(scripts_dir) not in sys.path:
-        sys.path.insert(0, str(scripts_dir))
+    _ensure_engine_path()
 
     from langgraph_engine.uml_generators import KrokiRenderer
     return KrokiRenderer()
@@ -180,12 +364,15 @@ def _resolve_project_file(project_path, source_file):
 # Tier 1: AST-based diagrams (no LLM required) -- UNCHANGED
 # ==================================================================
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate class diagram", False, False, True, False),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_class_diagram(
-    project_path: str,
-    scope: str = "all",
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    scope: Annotated[str, Field(description="\"all\" for the whole project, or a directory/file path relative to project_path to restrict the analysis.")] = "all",
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML class diagram from Python AST analysis.
 
@@ -202,7 +389,7 @@ def generate_class_diagram(
     _audit("generate_class_diagram", {"project_path": project_path, "scope": scope, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_class_diagram(scope=scope)
-    path = gen.save_diagram("class-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("class"), syntax)
     return {
         "diagram_type": "class",
         "format": "mermaid",
@@ -211,11 +398,14 @@ def generate_class_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate package diagram", False, False, True, False),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_package_diagram(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML package diagram from module import analysis.
 
@@ -229,7 +419,7 @@ def generate_package_diagram(
     _audit("generate_package_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_package_diagram()
-    path = gen.save_diagram("package-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("package"), syntax)
     return {
         "diagram_type": "package",
         "format": "mermaid",
@@ -238,11 +428,14 @@ def generate_package_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate component diagram", False, False, True, False),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_component_diagram(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML component diagram from project structure.
 
@@ -256,7 +449,7 @@ def generate_component_diagram(
     _audit("generate_component_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_component_diagram()
-    path = gen.save_diagram("component-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("component"), syntax)
     return {
         "diagram_type": "component",
         "format": "mermaid",
@@ -269,12 +462,15 @@ def generate_component_diagram(
 # Tier 2: AST + LLM hybrid diagrams -- UNCHANGED
 # ==================================================================
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate sequence diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_sequence_diagram(
-    project_path: str,
-    entry_function: str = "",
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    entry_function: Annotated[str, Field(description="Optional function name to trace the call chain from. Empty analyses the whole project.")] = "",
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML sequence diagram from call chain analysis.
 
@@ -289,7 +485,7 @@ def generate_sequence_diagram(
     _audit("generate_sequence_diagram", {"project_path": project_path, "entry_function": entry_function, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_sequence_diagram(context=entry_function)
-    path = gen.save_diagram("sequence-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("sequence"), syntax)
     return {
         "diagram_type": "sequence",
         "format": "mermaid",
@@ -298,12 +494,15 @@ def generate_sequence_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate activity diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_activity_diagram(
-    project_path: str,
-    function_path: str = "",
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    function_path: Annotated[str, Field(description="Optional \"file:function\" selector, e.g. \"src/main.py:run\". The file part is resolved inside project_path and rejected if it escapes it. Empty analyses the whole project.")] = "",
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML activity diagram from function logic.
 
@@ -325,7 +524,7 @@ def generate_activity_diagram(
             func_code = Path(resolved_file).read_text(encoding="utf-8", errors="replace")[:3000]
 
     syntax = gen.generate_activity_diagram(func_code)
-    path = gen.save_diagram("activity-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("activity"), syntax)
     return {
         "diagram_type": "activity",
         "format": "mermaid",
@@ -334,12 +533,15 @@ def generate_activity_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate state diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_state_diagram(
-    project_path: str,
-    context: str = "",
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    context: Annotated[str, Field(description="Free-text hint about the states and transitions in the system, passed to the LLM prompt.")] = "",
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML state diagram from state pattern detection.
 
@@ -354,7 +556,7 @@ def generate_state_diagram(
     _audit("generate_state_diagram", {"project_path": project_path, "context": context, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_state_diagram(context=context)
-    path = gen.save_diagram("state-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("state"), syntax)
     return {
         "diagram_type": "state",
         "format": "mermaid",
@@ -367,11 +569,14 @@ def generate_state_diagram(
 # Tier 3: LLM-powered diagrams -- UNCHANGED
 # ==================================================================
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate use case diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_usecase_diagram(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML use case diagram from requirements docs.
 
@@ -385,7 +590,7 @@ def generate_usecase_diagram(
     _audit("generate_usecase_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_usecase_diagram()
-    path = gen.save_diagram("usecase-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("usecase"), syntax)
     return {
         "diagram_type": "usecase",
         "format": "plantuml",
@@ -394,11 +599,14 @@ def generate_usecase_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate object diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_object_diagram(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML object diagram showing class instances.
 
@@ -412,7 +620,7 @@ def generate_object_diagram(
     _audit("generate_object_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_object_diagram()
-    path = gen.save_diagram("object-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("object"), syntax)
     return {
         "diagram_type": "object",
         "format": "plantuml",
@@ -421,11 +629,14 @@ def generate_object_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate deployment diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_deployment_diagram(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML deployment diagram from infrastructure files.
 
@@ -439,7 +650,7 @@ def generate_deployment_diagram(
     _audit("generate_deployment_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_deployment_diagram()
-    path = gen.save_diagram("deployment-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("deployment"), syntax)
     return {
         "diagram_type": "deployment",
         "format": "plantuml",
@@ -448,11 +659,14 @@ def generate_deployment_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate communication diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_communication_diagram(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML communication diagram from module interactions.
 
@@ -466,7 +680,7 @@ def generate_communication_diagram(
     _audit("generate_communication_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_communication_diagram()
-    path = gen.save_diagram("communication-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("communication"), syntax)
     return {
         "diagram_type": "communication",
         "format": "plantuml",
@@ -475,11 +689,14 @@ def generate_communication_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate composite structure diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_composite_structure_diagram(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML composite structure diagram.
 
@@ -493,7 +710,7 @@ def generate_composite_structure_diagram(
     _audit("generate_composite_structure_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_composite_structure_diagram()
-    path = gen.save_diagram("composite-structure-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("composite"), syntax)
     return {
         "diagram_type": "composite_structure",
         "format": "plantuml",
@@ -502,11 +719,14 @@ def generate_composite_structure_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate interaction overview diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_interaction_overview_diagram(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML interaction overview diagram.
 
@@ -520,7 +740,7 @@ def generate_interaction_overview_diagram(
     _audit("generate_interaction_overview_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_interaction_overview()
-    path = gen.save_diagram("interaction-overview-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("interaction"), syntax)
     return {
         "diagram_type": "interaction_overview",
         "format": "plantuml",
@@ -529,11 +749,14 @@ def generate_interaction_overview_diagram(
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate call graph diagram", False, False, True, False),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_call_graph_diagram(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a Mermaid flowchart showing the project call graph.
 
@@ -552,7 +775,7 @@ def generate_call_graph_diagram(
     _audit("generate_call_graph_diagram", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_call_graph_diagram()
-    path = gen.save_diagram("call-graph-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("call_graph"), syntax)
     return {
         "diagram_type": "call_graph",
         "format": "mermaid",
@@ -565,11 +788,14 @@ def generate_call_graph_diagram(
 # Utility tools -- UNCHANGED
 # ==================================================================
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate all diagrams", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_all_diagrams(
-    project_path: str,
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate all applicable UML diagrams for a project.
 
@@ -585,34 +811,51 @@ def generate_all_diagrams(
     """
     _audit("generate_all_diagrams", {"project_path": project_path, "output_dir": output_dir})
     gen = _get_generator(project_path, output_dir)
+
+    gen.output_dir.mkdir(parents=True, exist_ok=True)
+
     results = gen.generate_all()
 
-    timing_syntax = ""
     try:
-        timing_syntax = gen.generate_timing_diagram()
-        results["timing-diagram"] = timing_syntax
-    except Exception:
-        pass
+        results["timing-diagram"] = gen.generate_timing_diagram()
+    except Exception as exc:
+        _LOG.warning("timing-diagram generation failed: %s: %s", type(exc).__name__, exc)
 
     saved = []
+    failed = []
     for name, syntax in results.items():
-        path = gen.save_diagram(name, syntax)
-        saved.append({"name": name, "file": path})
+        stem = _canonical_stem(name)
+        try:
+            path = gen.save_diagram(stem, syntax)
+        except Exception as exc:
+            _LOG.error(
+                "saving %s failed: %s: %s", stem, type(exc).__name__, exc
+            )
+            failed.append(
+                {"name": stem, "error": str(exc), "error_type": type(exc).__name__}
+            )
+            continue
+        saved.append({"name": stem, "file": path})
 
     return {
         "diagrams_generated": len(saved),
         "diagrams": saved,
+        "diagrams_failed": len(failed),
+        "failed": failed,
         "output_dir": str(gen.output_dir),
     }
 
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Render diagram via Kroki", True, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def render_diagram(
-    diagram_text: str,
-    diagram_type: str = "plantuml",
-    output_format: str = "svg",
-    output_path: str = "",
+    diagram_text: Annotated[str, Field(description="PlantUML or Mermaid source text to render.")],
+    diagram_type: Annotated[str, Field(description="Source dialect passed to Kroki: \"plantuml\", \"mermaid\", \"graphviz\", and other Kroki-supported names.")] = "plantuml",
+    output_format: Annotated[str, Field(description="Rendered image format: \"svg\" or \"png\".")] = "svg",
+    output_path: Annotated[str, Field(description="File path to write the rendered image to. Empty returns only the byte size without writing.")] = "",
 ) -> dict:
     """Render any diagram via Kroki.io free API.
 
@@ -661,13 +904,16 @@ def render_diagram(
 # NEW Tool #15: generate_uml_from_code
 # ==================================================================
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate UML from one source file", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_uml_from_code(
-    project_path: str,
-    source_file: str,
-    language: str = "python",
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    source_file: Annotated[str, Field(description="Path to the source file, relative to project_path, e.g. \"src/models.py\". Validated to stay inside project_path.")],
+    language: Annotated[str, Field(description="Source language: \"python\" (stdlib AST), or \"java\", \"typescript\", \"kotlin\" (regex/LLM).")] = "python",
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML class diagram by AST-parsing a source file.
 
@@ -720,7 +966,7 @@ def generate_uml_from_code(
     lines_parsed = len(source_code.splitlines())
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_uml_from_code(source_code, language)
-    path = gen.save_diagram("uml-from-code-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("uml_from_code"), syntax)
 
     return {
         "diagram_type": "class",
@@ -735,11 +981,14 @@ def generate_uml_from_code(
 # NEW Tool #16: select_optimal_diagram_type
 # ==================================================================
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Select optimal diagram type", True, False, True, False),
+    structured_output=False,
+)
 @mcp_tool_handler
 def select_optimal_diagram_type(
-    project_description: str,
-    constraint: str = "",
+    project_description: Annotated[str, Field(description="Natural language description of what needs to be modelled. Truncated at 2000 characters; null bytes are rejected.")],
+    constraint: Annotated[str, Field(description="Optional diagram family hint: \"structural\", \"behavioral\", \"interaction\", or \"tooling\". Truncated at 200 characters.")] = "",
 ) -> dict:
     """Select the most appropriate UML diagram type for a given description.
 
@@ -810,12 +1059,15 @@ def select_optimal_diagram_type(
 # NEW Tool #17: generate_timing_diagram
 # ==================================================================
 
-@mcp.tool()
+@_tool(
+    annotations=_annotations("Generate timing diagram", False, False, True, True),
+    structured_output=False,
+)
 @mcp_tool_handler
 def generate_timing_diagram(
-    project_path: str,
-    process_name: str = "",
-    output_dir: str = "docs/uml",
+    project_path: ProjectPath,
+    process_name: Annotated[str, Field(description="Process name used as the gantt title. Truncated at 200 characters; empty renders as \"Process\".")] = "",
+    output_dir: OutputDir = "",
 ) -> dict:
     """Generate a UML timing diagram as Mermaid gantt syntax.
 
@@ -853,7 +1105,7 @@ def generate_timing_diagram(
 
     gen = _get_generator(project_path, output_dir)
     syntax = gen.generate_timing_diagram(process_name)
-    path = gen.save_diagram("timing-diagram", syntax)
+    path = gen.save_diagram(_canonical_stem("timing"), syntax)
 
     return {
         "diagram_type": "timing",

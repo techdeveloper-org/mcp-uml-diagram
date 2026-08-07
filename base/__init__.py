@@ -21,6 +21,7 @@ from .response import MCPResponse, success, error, to_json
 from .decorators import mcp_tool_handler
 from .persistence import (
     AtomicJsonStore,
+    ConcurrentModificationError,
     JsonlAppender,
     SessionIdResolver,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "to_json",
     "mcp_tool_handler",
     "AtomicJsonStore",
+    "ConcurrentModificationError",
     "JsonlAppender",
     "SessionIdResolver",
     "LazyClient",
