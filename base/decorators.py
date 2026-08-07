@@ -87,7 +87,9 @@ def mcp_tool_handler(
             Returns:
                 JSON string with ``success`` field and tool results or error details.
             """
-            start = time.time() if log_duration else 0
+            # Monotonic, not wall-clock: an NTP correction mid-call would
+            # otherwise produce a negative or wildly inflated duration_ms.
+            start = time.monotonic() if log_duration else 0.0
 
             try:
                 result = fn(*args, **kwargs)
@@ -97,24 +99,28 @@ def mcp_tool_handler(
                 if isinstance(result, str):
                     return result
 
-                # If function returns a dict, wrap with success
+                # If function returns a dict, wrap with success.
+                # Copied rather than mutated in place: the tool may have
+                # returned a cached or module-level dict, and stamping
+                # success/duration_ms onto it would corrupt later reads.
                 if isinstance(result, dict):
-                    if "success" not in result:
-                        result["success"] = True
+                    payload = dict(result)
+                    if "success" not in payload:
+                        payload["success"] = True
 
                     if log_duration:
-                        result["duration_ms"] = round(
-                            (time.time() - start) * 1000
+                        payload["duration_ms"] = round(
+                            (time.monotonic() - start) * 1000
                         )
 
-                    return _serialize(result)
+                    return _serialize(payload)
 
                 # If function returns None, treat as success with no data
                 if result is None:
                     payload = {"success": True}
                     if log_duration:
                         payload["duration_ms"] = round(
-                            (time.time() - start) * 1000
+                            (time.monotonic() - start) * 1000
                         )
                     return _serialize(payload)
 
@@ -124,14 +130,17 @@ def mcp_tool_handler(
             except error_types as e:
                 err_payload = {
                     "success": False,
-                    "error": str(e),
+                    # str(e) is empty for exceptions raised without a message,
+                    # which would otherwise emit "error": "" and tell the model
+                    # nothing at all about the failure.
+                    "error": str(e) or type(e).__name__,
                     "error_type": type(e).__name__,
                 }
                 if include_traceback:
                     err_payload["traceback"] = traceback.format_exc()[-500:]
                 if log_duration:
                     err_payload["duration_ms"] = round(
-                        (time.time() - start) * 1000
+                        (time.monotonic() - start) * 1000
                     )
                 return _serialize(err_payload)
 

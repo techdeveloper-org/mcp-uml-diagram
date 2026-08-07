@@ -3,10 +3,14 @@
 Strips null bytes, enforces length limits, and detects prompt injection patterns.
 
 Usage:
-    from src.mcp.input_validator import validate_input, validate_task_input
+    from input_validator import validate_input, validate_task_input
     clean = validate_input(raw_value, max_length=4096)
     task = validate_task_input(raw_task)  # stricter: prompt injection detection
+
+Windows-Safe: ASCII only (cp1252 compatible)
 """
+
+import json
 
 # Patterns that indicate an attempt to override or ignore system instructions.
 # All comparisons are performed case-insensitively.
@@ -18,6 +22,26 @@ PROMPT_INJECTION_PATTERNS = [
     "disregard",
     "forget your instructions",
 ]
+
+
+def _validation_error(field_name, reason):
+    # type: (str, str) -> str
+    """Build the JSON error payload carried by a ValueError message.
+
+    Uses json.dumps rather than string formatting so a field_name containing
+    a quote, backslash or control character still produces parseable JSON --
+    callers are documented to be able to json.loads() this message.
+
+    Args:
+        field_name: Name of the field that failed validation.
+        reason: Short machine-readable failure reason.
+
+    Returns:
+        A JSON object string with "error", "field" and "reason" keys.
+    """
+    return json.dumps(
+        {"error": "invalid_input", "field": field_name, "reason": reason}
+    )
 
 
 def validate_input(value, max_length=4096, field_name="input"):
@@ -55,9 +79,7 @@ def validate_input(value, max_length=4096, field_name="input"):
 
     # Enforce length limit
     if len(cleaned) > max_length:
-        raise ValueError(
-            '{{"error": "invalid_input", "field": "{}", "reason": "exceeds max length"}}'.format(field_name)
-        )
+        raise ValueError(_validation_error(field_name, "exceeds max length"))
 
     return cleaned
 
@@ -87,7 +109,7 @@ def validate_task_input(value, max_length=2000):
     for pattern in PROMPT_INJECTION_PATTERNS:
         if pattern.lower() in lower:
             raise ValueError(
-                '{{"error": "invalid_input", "field": "task", ' '"reason": "prompt injection pattern detected"}}'
+                _validation_error("task", "prompt injection pattern detected")
             )
 
     return cleaned

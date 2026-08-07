@@ -17,10 +17,33 @@ Windows-Safe: ASCII only (cp1252 compatible)
 """
 
 import os
+import sys
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
+
+
+def _log_warning(event: str, **fields: Any) -> None:
+    """Emit a single-line structured warning to stderr.
+
+    Defined locally rather than imported so this module stays self-contained
+    when it is vendored into a server repo as ``base/clients.py``. Output is
+    forced to ASCII because stderr on Windows is cp1252 and a non-Latin-1
+    character in an exception message would otherwise raise
+    ``UnicodeEncodeError`` from inside the error path itself.
+
+    Args:
+        event: Short machine-readable event name.
+        **fields: Additional key=value context to include.
+    """
+    parts = ["level=WARNING", "component=mcp_base.clients", "event=" + event]
+    parts.extend("{}={}".format(key, value) for key, value in fields.items())
+    line = " ".join(parts)
+    try:
+        sys.stderr.write(line.encode("ascii", "backslashreplace").decode("ascii") + "\n")
+    except (OSError, ValueError):
+        pass  # stderr is closed or detached; the caller's operation must still proceed
 
 
 class LazyClient(ABC):
@@ -95,9 +118,15 @@ class LazyClient(ABC):
                 self._client = self._initialize()
                 self._available = self._client is not None
             except Exception as e:
-                self._error = str(e)
+                self._error = str(e) or type(e).__name__
                 self._available = False
                 self._client = None
+                _log_warning(
+                    "lazy_client_init_failed",
+                    client=self.__class__.__name__,
+                    error=type(e).__name__,
+                    detail=self._error,
+                )
 
         return self._client
 
@@ -298,6 +327,29 @@ class GitRepoClient(LazyClient):
         return None
 
 
+_IDEMPOTENT_METHODS = frozenset(
+    {"GET", "HEAD", "OPTIONS", "PUT", "DELETE", "TRACE"}
+)
+"""HTTP methods that are safe to retry automatically.
+
+Deliberately excludes POST and PATCH. PyGithub's ``GithubRetry`` adds POST to
+urllib3's allowed-methods set, which urllib3 itself omits by design, and pairs
+it with ``total=10`` and a ``status_forcelist`` spanning 500-599 plus 403. A
+write that GitHub accepts and processes, but whose response is slow past the
+15-second default timeout or returns a 5xx afterwards, is therefore retried --
+creating the resource a second time.
+
+This was observed, not theorised: a single ``create_issue`` call produced issues
+#256 and #257 on techdeveloper-org/claude-workflow-engine, identical in title
+and labels, 42 seconds apart, with the open-issue count verified as zero
+immediately beforehand. Retrying a non-idempotent write cannot be made safe
+without a server-side idempotency key, which the GitHub REST API does not offer
+for issue creation, so the retry is removed instead.
+
+Reads keep the full retry budget; only unsafe methods lose it.
+"""
+
+
 class GitHubApiClient(LazyClient):
     """Lazy PyGithub client with automatic token resolution.
 
@@ -323,6 +375,7 @@ class GitHubApiClient(LazyClient):
         """
         try:
             from github import Github
+            from github.GithubRetry import GithubRetry
         except ImportError:
             raise RuntimeError(
                 "PyGithub not installed. Install with: pip install PyGithub"
@@ -335,7 +388,9 @@ class GitHubApiClient(LazyClient):
                 "login with: gh auth login"
             )
 
-        return Github(token)
+        return Github(token, retry=GithubRetry(
+            total=10, allowed_methods=_IDEMPOTENT_METHODS
+        ))
 
     @staticmethod
     def _resolve_token() -> Optional[str]:
@@ -389,6 +444,25 @@ class GitHubApiClient(LazyClient):
         return client.get_repo(f"{owner}/{name}")
 
     @staticmethod
+    def _strip_git_suffix(url: str) -> str:
+        """Remove one trailing ``.git`` from a remote URL.
+
+        A blanket ``url.replace(".git", "")`` corrupts any URL whose owner or
+        repository name contains that substring: ``owner/site.github.io.git``
+        loses both occurrences and resolves to the repository ``sitehub.io``,
+        which does not exist. Only the terminal suffix is a URL decoration.
+
+        Args:
+            url: Remote URL, with or without a trailing ``.git``.
+
+        Returns:
+            The URL without its trailing ``.git`` suffix.
+        """
+        if url.endswith(".git"):
+            return url[: -len(".git")]
+        return url
+
+    @staticmethod
     def _parse_remote(repo_path: str = ".") -> Tuple[Optional[str], Optional[str]]:
         """Parse ``owner/repo`` from git remote origin URL.
 
@@ -403,19 +477,36 @@ class GitHubApiClient(LazyClient):
         """
         try:
             from git import Repo
+        except ImportError:
+            _log_warning("git_import_failed", repo_path=repo_path)
+            return None, None
+
+        try:
             repo = Repo(repo_path)
             url = repo.remotes.origin.url
-            if "github.com" not in url:
-                return None, None
-            if url.startswith("git@"):
-                parts = url.split(":")[-1].replace(".git", "").split("/")
-            else:
-                parts = url.rstrip("/").replace(".git", "").split("/")[-2:]
-            if len(parts) >= 2:
-                return parts[0], parts[1]
+        except Exception as e:
+            # GitPython raises InvalidGitRepositoryError / NoSuchPathError here,
+            # neither of which is importable without a hard GitPython dependency,
+            # and AttributeError when no "origin" remote is configured.
+            _log_warning(
+                "git_remote_unreadable",
+                repo_path=repo_path,
+                error=type(e).__name__,
+            )
             return None, None
-        except (ImportError, IndexError, AttributeError):
+
+        if "github.com" not in url:
             return None, None
+
+        trimmed = GitHubApiClient._strip_git_suffix(url.rstrip("/"))
+        if url.startswith("git@"):
+            parts = trimmed.split(":")[-1].split("/")
+        else:
+            parts = trimmed.split("/")[-2:]
+
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            return parts[0], parts[1]
+        return None, None
 
 
 class QdrantManager(LazyClient):
@@ -428,9 +519,10 @@ class QdrantManager(LazyClient):
     Class Attributes:
         COLLECTIONS: Registry of collection names with their vector
             size and distance metric configuration.
-        DB_PATH: Filesystem path for Qdrant local storage.
-            Evaluated lazily inside ``_initialize()`` to respect
-            test environment overrides.
+
+    The storage directory is resolved by ``_get_db_path()`` rather than a class
+    constant, so it is evaluated at initialization time and honors a test
+    environment that relocates the home directory.
     """
 
     COLLECTIONS = {
