@@ -25,6 +25,13 @@ _buckets_lock = threading.Lock()
 _BUCKET_DEFAULTS = {
     "tool_calls": (100, 100.0 / 60.0),  # 100 per minute
     "llm_calls": (10, 10.0 / 60.0),  # 10 per minute
+    # For tools that fan out internally: one invocation issues several upstream
+    # requests, so the tool-call rate is not the request rate. A tool looping
+    # ten calls per invocation at the tool_calls rate would issue 1000 upstream
+    # requests a minute. Sized so that ten-fold amplification stays within a
+    # 600/minute upstream cap, which is the Google URL Inspection limit that
+    # motivated it.
+    "amplified_calls": (10, 10.0 / 60.0),  # 10 per minute
 }
 
 _FALLBACK_BUCKET = (60, 60.0 / 60.0)
@@ -173,7 +180,11 @@ def check_rate_limit(client_id="default", bucket="tool_calls"):
         client_id: Identifier for the client (e.g. IP address, process ID,
                    or "default" for a shared anonymous bucket).
         bucket: Name of the rate limit bucket. Predefined buckets:
-                "tool_calls" (100/min), "llm_calls" (10/min).
+                "tool_calls" (100/min) for ordinary tools, "llm_calls"
+                (10/min) for calls that bill or consume inference per
+                invocation, and "amplified_calls" (10/min) for tools that
+                issue several upstream requests per invocation, where the
+                tool-call rate is not the upstream request rate.
                 Unknown bucket names fall back to 60/min defaults.
 
     Returns:

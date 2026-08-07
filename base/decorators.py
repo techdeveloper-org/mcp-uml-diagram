@@ -29,11 +29,81 @@ Windows-Safe: ASCII only (cp1252 compatible)
 """
 
 import functools
+import os
+import sys
+import threading
 import time
 import traceback
 from typing import Callable, Optional, Tuple, Type, Union
 
 from .response import _serialize
+
+# ``rate_limiter`` lives at the repository root while this module lives inside
+# the package, in both the mcp-base layout and the vendored ``base/`` layout.
+# Any server that can import this module already has that root on sys.path,
+# so a flat import resolves in both. It is guarded anyway: a server that
+# vendors the package without the limiter must keep working.
+try:
+    from rate_limiter import check_rate_limit as _check_rate_limit
+    _RATE_LIMITER_AVAILABLE = True
+except ImportError:
+    _RATE_LIMITER_AVAILABLE = False
+
+    def _check_rate_limit(client_id="default", bucket="tool_calls"):
+        """Fallback used when the limiter module is not importable."""
+        return {"allowed": True}
+
+
+_MISSING_LIMITER_WARNED = threading.Event()
+
+
+def _log_warning(event: str, **fields) -> None:
+    """Emit a single-line structured warning to stderr.
+
+    Defined locally so this module stays self-contained when vendored as
+    ``base/decorators.py``. Output is forced to ASCII because stderr on
+    Windows is cp1252.
+
+    Args:
+        event: Short machine-readable event name.
+        **fields: Additional key=value context.
+    """
+    parts = ["level=WARNING", "component=mcp_base.decorators", "event=" + event]
+    parts.extend("{}={}".format(key, value) for key, value in fields.items())
+    line = " ".join(parts)
+    try:
+        sys.stderr.write(line.encode("ascii", "backslashreplace").decode("ascii") + "\n")
+    except (OSError, ValueError):
+        pass
+
+
+def _rate_limit_verdict(bucket: str) -> dict:
+    """Consume one token from ``bucket`` and report whether the call may run.
+
+    Enforcement is opt-in: with ENABLE_RATE_LIMITING unset, the limiter
+    returns allowed without creating any bucket state, so this costs one
+    environment lookup and nothing else.
+
+    If limiting is switched on but the limiter module could not be imported,
+    this warns once rather than failing open silently -- an operator who set
+    the variable is entitled to know it is doing nothing.
+
+    Args:
+        bucket: Name of the token bucket to draw from.
+
+    Returns:
+        The limiter verdict dict, always containing "allowed".
+    """
+    if not _RATE_LIMITER_AVAILABLE:
+        if (os.environ.get("ENABLE_RATE_LIMITING") == "1"
+                and not _MISSING_LIMITER_WARNED.is_set()):
+            _MISSING_LIMITER_WARNED.set()
+            _log_warning(
+                "rate_limiting_enabled_but_limiter_unavailable",
+                detail="ENABLE_RATE_LIMITING=1 has no effect; rate_limiter is not importable",
+            )
+        return {"allowed": True}
+    return _check_rate_limit(bucket=bucket)
 
 
 def mcp_tool_handler(
@@ -42,6 +112,7 @@ def mcp_tool_handler(
     error_types: Tuple[Type[Exception], ...] = (Exception,),
     include_traceback: bool = False,
     log_duration: bool = False,
+    rate_limit_bucket: Optional[str] = "tool_calls",
 ):
     """Decorator that wraps MCP tool functions with standardized error handling.
 
@@ -60,6 +131,19 @@ def mcp_tool_handler(
             like ``KeyboardInterrupt`` and ``SystemExit`` are never caught.
         include_traceback: If True, include last 500 chars of traceback in error response.
         log_duration: If True, add ``duration_ms`` field to response.
+        rate_limit_bucket: Token bucket this tool draws from before running,
+            or None to exempt the tool entirely. Defaults to ``"tool_calls"``.
+            Enforcement is opt-in at runtime via ENABLE_RATE_LIMITING=1, so
+            the default changes nothing until an operator switches it on.
+
+            Pass ``"llm_calls"`` for tools that bill per invocation, and None
+            for pure local computation. Exempting pure computation is not
+            cosmetic: a shared bucket drained by cheap in-process helpers
+            leaves no budget for the calls that actually reach a quota.
+
+            The bucket is per server process, which is the unit that matters
+            for protecting an upstream quota -- one server must not be able to
+            exhaust an API allowance on its own.
 
     Returns:
         Decorated function that returns a JSON string.
@@ -87,6 +171,21 @@ def mcp_tool_handler(
             Returns:
                 JSON string with ``success`` field and tool results or error details.
             """
+            if rate_limit_bucket is not None:
+                verdict = _rate_limit_verdict(rate_limit_bucket)
+                if not verdict.get("allowed", True):
+                    return _serialize({
+                        "success": False,
+                        "error": "Rate limit exceeded for bucket '{}'. "
+                                 "Retry in {} seconds.".format(
+                                     rate_limit_bucket,
+                                     verdict.get("retry_after"),
+                                 ),
+                        "error_type": "RateLimitExceeded",
+                        "bucket": rate_limit_bucket,
+                        "retry_after": verdict.get("retry_after"),
+                    })
+
             # Monotonic, not wall-clock: an NTP correction mid-call would
             # otherwise produce a negative or wildly inflated duration_ms.
             start = time.monotonic() if log_duration else 0.0
