@@ -159,6 +159,109 @@ OutputDir = Annotated[str, Field(
     )
 )]
 
+
+def _model_data_field(primary_key):
+    """Build a ModelData Field description naming this diagram type's primary key.
+
+    Args:
+        primary_key: The UDM key this diagram type requires (e.g. "classes",
+            "nodes", "steps") -- see UDM_PRIMARY_KEY.
+
+    Returns:
+        An Annotated[str, Field(...)] type for use as a tool parameter.
+    """
+    return Annotated[str, Field(
+        description=(
+            "Optional JSON object of pre-built structural data to render from, "
+            "instead of scanning project_path for source code. Use this when the "
+            "authoritative structure lives somewhere other than code -- an "
+            "architecture corpus, a spec, or a schema. When supplied, the diagram "
+            "is rendered deterministically from this payload and no AST scan or "
+            "LLM call is performed; when omitted, behaviour is unchanged. The "
+            "object must contain a non-empty \"%s\" list; a payload missing it is "
+            "rejected rather than silently rendered from placeholder data. "
+            "Max 512 KB (see UML_MAX_MODEL_DATA_KB)." % primary_key
+        )
+    )]
+
+
+# Generic fallback for tools (generate_all_diagrams) that are not specific to
+# one diagram type's primary key.
+ModelData = Annotated[str, Field(
+    description=(
+        "Optional JSON object of pre-built structural data to render from, "
+        "instead of scanning project_path for source code. Use this when the "
+        "authoritative structure lives somewhere other than code -- an "
+        "architecture corpus, a spec, or a schema. When supplied, the diagram "
+        "is rendered deterministically from this payload and no AST scan or "
+        "LLM call is performed; when omitted, behaviour is unchanged. The "
+        "object must contain the primary key for this diagram type (for "
+        "example \"classes\" for class, \"nodes\" for deployment, \"steps\" "
+        "for activity); a payload missing it is rejected rather than "
+        "silently rendered from placeholder data. Max 512 KB."
+    )
+)]
+
+_MAX_MODEL_DATA_BYTES = int(os.environ.get("UML_MAX_MODEL_DATA_KB", "512")) * 1024
+
+
+def _parse_model_data(raw, diagram_type):
+    # type: (str, str) -> Tuple[Optional[dict], Optional[str]]
+    """Parse and validate a caller-supplied model_data JSON string.
+
+    Args:
+        raw: JSON object string, or "" when the parameter was not supplied.
+        diagram_type: Diagram type slug, used to check the UDM primary key.
+
+    Returns:
+        (data, error): (None, None) when raw is empty ("not supplied" -- the
+        caller follows the existing derived path); (dict, None) on success;
+        (None, str) with a caller-actionable message on validation failure.
+    """
+    if raw is None or raw.strip() == "":
+        return None, None
+
+    raw_bytes = raw.encode("utf-8")
+    if len(raw_bytes) > _MAX_MODEL_DATA_BYTES:
+        return None, (
+            "model_data exceeds %d KB limit; set UML_MAX_MODEL_DATA_KB to raise it"
+            % (_MAX_MODEL_DATA_BYTES // 1024)
+        )
+    if "\x00" in raw:
+        return None, "model_data contains null bytes"
+
+    try:
+        data = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        return None, "model_data is not valid JSON: %s at line %d column %d" % (
+            exc.msg, exc.lineno, exc.colno,
+        )
+
+    if not isinstance(data, dict):
+        return None, "model_data must be a JSON object, got %s" % type(data).__name__
+
+    try:
+        from langgraph_engine.uml_generators import UDM_PRIMARY_KEY
+    except ImportError:
+        return None, "langgraph_engine not available; cannot validate model_data"
+
+    if diagram_type not in UDM_PRIMARY_KEY:
+        return None, "unknown diagram_type for model_data validation: %s" % diagram_type
+
+    primary_key = UDM_PRIMARY_KEY[diagram_type]
+    value = data.get(primary_key)
+    if not value:
+        return None, (
+            "model_data for '%s' must contain a non-empty '%s' list"
+            % (diagram_type, primary_key)
+        )
+    if not isinstance(value, list):
+        return None, "model_data['%s'] must be a list, got %s" % (
+            primary_key, type(value).__name__,
+        )
+
+    return data, None
+
 # Canonical output file stems mandated for the standard diagram set. The engine
 # names its results with hyphens and two longer stems; every write goes through
 # _canonical_stem() so the files on disk carry these exact names.
@@ -182,6 +285,26 @@ _ENGINE_STEM_ALIASES = {
     "composite_structure_diagram": "composite_diagram",
     "interaction_overview_diagram": "interaction_diagram",
     "use_case_diagram": "usecase_diagram",
+}
+
+# Diagram-type slug (UDM_PRIMARY_KEY / generate_from_data key) -> the hyphenated
+# key UMLDiagramGenerator.generate_all() uses in its results dict. Needed only
+# by generate_all_diagrams's model_data map to route a per-type payload to the
+# right slot in that dict.
+_SLUG_TO_ENGINE_KEY = {
+    "class": "class-diagram",
+    "package": "package-diagram",
+    "component": "component-diagram",
+    "call_graph": "call-graph-diagram",
+    "sequence": "sequence-diagram",
+    "activity": "activity-diagram",
+    "state": "state-diagram",
+    "usecase": "usecase-diagram",
+    "object": "object-diagram",
+    "deployment": "deployment-diagram",
+    "communication": "communication-diagram",
+    "composite": "composite-structure-diagram",
+    "interaction": "interaction-overview-diagram",
 }
 
 _DIAGRAM_TYPE_TO_SKILL = {
@@ -373,6 +496,7 @@ def generate_class_diagram(
     project_path: ProjectPath,
     scope: Annotated[str, Field(description="\"all\" for the whole project, or a directory/file path relative to project_path to restrict the analysis.")] = "all",
     output_dir: OutputDir = "",
+    model_data: _model_data_field("classes") = "",
 ) -> dict:
     """Generate a UML class diagram from Python AST analysis.
 
@@ -385,16 +509,32 @@ def generate_class_diagram(
         project_path: Root path of the project to analyze.
         scope: "all" for full project, or a specific directory/file path.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"classes": [...]}) to render
+            deterministically instead of scanning project_path.
     """
-    _audit("generate_class_diagram", {"project_path": project_path, "scope": scope, "output_dir": output_dir})
+    _audit("generate_class_diagram", {
+        "project_path": project_path, "scope": scope, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "class")
+    if err:
+        return {"diagram_type": "class", "format": "mermaid", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_class_diagram(scope=scope)
+    if data is not None:
+        syntax = gen.generate_from_data("class", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_class_diagram(scope=scope)
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("class"), syntax)
     return {
         "diagram_type": "class",
         "format": "mermaid",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -406,6 +546,7 @@ def generate_class_diagram(
 def generate_package_diagram(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: _model_data_field("packages") = "",
 ) -> dict:
     """Generate a UML package diagram from module import analysis.
 
@@ -415,16 +556,33 @@ def generate_package_diagram(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"packages": [...], "imports":
+            [...]}) to render deterministically instead of scanning
+            project_path.
     """
-    _audit("generate_package_diagram", {"project_path": project_path, "output_dir": output_dir})
+    _audit("generate_package_diagram", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "package")
+    if err:
+        return {"diagram_type": "package", "format": "mermaid", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_package_diagram()
+    if data is not None:
+        syntax = gen.generate_from_data("package", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_package_diagram()
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("package"), syntax)
     return {
         "diagram_type": "package",
         "format": "mermaid",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -436,6 +594,7 @@ def generate_package_diagram(
 def generate_component_diagram(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: _model_data_field("components") = "",
 ) -> dict:
     """Generate a UML component diagram from project structure.
 
@@ -445,16 +604,33 @@ def generate_component_diagram(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"components": [{"name",
+            "provides", "requires"}], "dependencies": [...]}) to render
+            deterministically instead of scanning project_path.
     """
-    _audit("generate_component_diagram", {"project_path": project_path, "output_dir": output_dir})
+    _audit("generate_component_diagram", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "component")
+    if err:
+        return {"diagram_type": "component", "format": "mermaid", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_component_diagram()
+    if data is not None:
+        syntax = gen.generate_from_data("component", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_component_diagram()
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("component"), syntax)
     return {
         "diagram_type": "component",
         "format": "mermaid",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -471,6 +647,7 @@ def generate_sequence_diagram(
     project_path: ProjectPath,
     entry_function: Annotated[str, Field(description="Optional function name to trace the call chain from. Empty analyses the whole project.")] = "",
     output_dir: OutputDir = "",
+    model_data: _model_data_field("call_chains") = "",
 ) -> dict:
     """Generate a UML sequence diagram from call chain analysis.
 
@@ -481,16 +658,33 @@ def generate_sequence_diagram(
         project_path: Root path of the project to analyze.
         entry_function: Optional entry function to trace from.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"participants": [...],
+            "call_chains": [...]}) to render deterministically instead of
+            scanning project_path. entry_function is ignored when supplied.
     """
-    _audit("generate_sequence_diagram", {"project_path": project_path, "entry_function": entry_function, "output_dir": output_dir})
+    _audit("generate_sequence_diagram", {
+        "project_path": project_path, "entry_function": entry_function,
+        "output_dir": output_dir, "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "sequence")
+    if err:
+        return {"diagram_type": "sequence", "format": "mermaid", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_sequence_diagram(context=entry_function)
+    if data is not None:
+        syntax = gen.generate_from_data("sequence", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_sequence_diagram(context=entry_function)
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("sequence"), syntax)
     return {
         "diagram_type": "sequence",
         "format": "mermaid",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -503,6 +697,7 @@ def generate_activity_diagram(
     project_path: ProjectPath,
     function_path: Annotated[str, Field(description="Optional \"file:function\" selector, e.g. \"src/main.py:run\". The file part is resolved inside project_path and rejected if it escapes it. Empty analyses the whole project.")] = "",
     output_dir: OutputDir = "",
+    model_data: _model_data_field("steps") = "",
 ) -> dict:
     """Generate a UML activity diagram from function logic.
 
@@ -512,24 +707,40 @@ def generate_activity_diagram(
         project_path: Root path of the project to analyze.
         function_path: Optional file:function to analyze (e.g., "src/main.py:run").
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"steps": [{"name", "type"}]})
+            to render deterministically instead of using the LLM.
     """
-    _audit("generate_activity_diagram", {"project_path": project_path, "function_path": function_path, "output_dir": output_dir})
+    _audit("generate_activity_diagram", {
+        "project_path": project_path, "function_path": function_path,
+        "output_dir": output_dir, "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "activity")
+    if err:
+        return {"diagram_type": "activity", "format": "mermaid", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
 
-    func_code = ""
-    if function_path and ":" in function_path:
-        file_part, _func_name = function_path.rsplit(":", 1)
-        resolved_file, _err = _resolve_project_file(project_path, file_part)
-        if resolved_file:
-            func_code = Path(resolved_file).read_text(encoding="utf-8", errors="replace")[:3000]
+    if data is not None:
+        syntax = gen.generate_from_data("activity", data)
+        source = "model_data"
+    else:
+        func_code = ""
+        if function_path and ":" in function_path:
+            file_part, _func_name = function_path.rsplit(":", 1)
+            resolved_file, _err = _resolve_project_file(project_path, file_part)
+            if resolved_file:
+                func_code = Path(resolved_file).read_text(encoding="utf-8", errors="replace")[:3000]
+        syntax = gen.generate_activity_diagram(func_code)
+        source = "derived"
 
-    syntax = gen.generate_activity_diagram(func_code)
     path = gen.save_diagram(_canonical_stem("activity"), syntax)
     return {
         "diagram_type": "activity",
         "format": "mermaid",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -542,6 +753,7 @@ def generate_state_diagram(
     project_path: ProjectPath,
     context: Annotated[str, Field(description="Free-text hint about the states and transitions in the system, passed to the LLM prompt.")] = "",
     output_dir: OutputDir = "",
+    model_data: _model_data_field("states") = "",
 ) -> dict:
     """Generate a UML state diagram from state pattern detection.
 
@@ -552,16 +764,33 @@ def generate_state_diagram(
         project_path: Root path of the project to analyze.
         context: Additional context about states in the system.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"states": [...],
+            "transitions": [...]}) to render deterministically instead of
+            using the LLM.
     """
-    _audit("generate_state_diagram", {"project_path": project_path, "context": context, "output_dir": output_dir})
+    _audit("generate_state_diagram", {
+        "project_path": project_path, "context": context, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "state")
+    if err:
+        return {"diagram_type": "state", "format": "mermaid", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_state_diagram(context=context)
+    if data is not None:
+        syntax = gen.generate_from_data("state", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_state_diagram(context=context)
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("state"), syntax)
     return {
         "diagram_type": "state",
         "format": "mermaid",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -577,6 +806,7 @@ def generate_state_diagram(
 def generate_usecase_diagram(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: _model_data_field("use_cases") = "",
 ) -> dict:
     """Generate a UML use case diagram from requirements docs.
 
@@ -586,16 +816,32 @@ def generate_usecase_diagram(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"use_cases": [...], "actors":
+            [...]}) to render deterministically instead of using the LLM.
     """
-    _audit("generate_usecase_diagram", {"project_path": project_path, "output_dir": output_dir})
+    _audit("generate_usecase_diagram", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "usecase")
+    if err:
+        return {"diagram_type": "usecase", "format": "plantuml", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_usecase_diagram()
+    if data is not None:
+        syntax = gen.generate_from_data("usecase", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_usecase_diagram()
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("usecase"), syntax)
     return {
         "diagram_type": "usecase",
         "format": "plantuml",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -607,6 +853,7 @@ def generate_usecase_diagram(
 def generate_object_diagram(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: _model_data_field("objects") = "",
 ) -> dict:
     """Generate a UML object diagram showing class instances.
 
@@ -616,16 +863,32 @@ def generate_object_diagram(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"objects": [{"name", "class",
+            "values"}]}) to render deterministically instead of using the LLM.
     """
-    _audit("generate_object_diagram", {"project_path": project_path, "output_dir": output_dir})
+    _audit("generate_object_diagram", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "object")
+    if err:
+        return {"diagram_type": "object", "format": "plantuml", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_object_diagram()
+    if data is not None:
+        syntax = gen.generate_from_data("object", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_object_diagram()
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("object"), syntax)
     return {
         "diagram_type": "object",
         "format": "plantuml",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -637,6 +900,7 @@ def generate_object_diagram(
 def generate_deployment_diagram(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: _model_data_field("nodes") = "",
 ) -> dict:
     """Generate a UML deployment diagram from infrastructure files.
 
@@ -646,16 +910,32 @@ def generate_deployment_diagram(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"nodes": [{"name", "type",
+            "artifacts"}]}) to render deterministically instead of using the LLM.
     """
-    _audit("generate_deployment_diagram", {"project_path": project_path, "output_dir": output_dir})
+    _audit("generate_deployment_diagram", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "deployment")
+    if err:
+        return {"diagram_type": "deployment", "format": "plantuml", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_deployment_diagram()
+    if data is not None:
+        syntax = gen.generate_from_data("deployment", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_deployment_diagram()
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("deployment"), syntax)
     return {
         "diagram_type": "deployment",
         "format": "plantuml",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -667,6 +947,7 @@ def generate_deployment_diagram(
 def generate_communication_diagram(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: _model_data_field("participants") = "",
 ) -> dict:
     """Generate a UML communication diagram from module interactions.
 
@@ -676,16 +957,33 @@ def generate_communication_diagram(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"participants": [...],
+            "messages": [...]}) to render deterministically instead of
+            using the LLM.
     """
-    _audit("generate_communication_diagram", {"project_path": project_path, "output_dir": output_dir})
+    _audit("generate_communication_diagram", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "communication")
+    if err:
+        return {"diagram_type": "communication", "format": "plantuml", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_communication_diagram()
+    if data is not None:
+        syntax = gen.generate_from_data("communication", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_communication_diagram()
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("communication"), syntax)
     return {
         "diagram_type": "communication",
         "format": "plantuml",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -697,6 +995,7 @@ def generate_communication_diagram(
 def generate_composite_structure_diagram(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: _model_data_field("components") = "",
 ) -> dict:
     """Generate a UML composite structure diagram.
 
@@ -706,16 +1005,33 @@ def generate_composite_structure_diagram(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"components": [{"name",
+            "parts", "ports"}]}) to render deterministically instead of
+            using the LLM.
     """
-    _audit("generate_composite_structure_diagram", {"project_path": project_path, "output_dir": output_dir})
+    _audit("generate_composite_structure_diagram", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "composite")
+    if err:
+        return {"diagram_type": "composite_structure", "format": "plantuml", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_composite_structure_diagram()
+    if data is not None:
+        syntax = gen.generate_from_data("composite", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_composite_structure_diagram()
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("composite"), syntax)
     return {
         "diagram_type": "composite_structure",
         "format": "plantuml",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -727,6 +1043,7 @@ def generate_composite_structure_diagram(
 def generate_interaction_overview_diagram(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: _model_data_field("steps") = "",
 ) -> dict:
     """Generate a UML interaction overview diagram.
 
@@ -736,16 +1053,32 @@ def generate_interaction_overview_diagram(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"steps": [{"type", "name"}]})
+            to render deterministically instead of using the LLM.
     """
-    _audit("generate_interaction_overview_diagram", {"project_path": project_path, "output_dir": output_dir})
+    _audit("generate_interaction_overview_diagram", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "interaction")
+    if err:
+        return {"diagram_type": "interaction_overview", "format": "plantuml", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_interaction_overview()
+    if data is not None:
+        syntax = gen.generate_from_data("interaction", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_interaction_overview()
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("interaction"), syntax)
     return {
         "diagram_type": "interaction_overview",
         "format": "plantuml",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -757,6 +1090,7 @@ def generate_interaction_overview_diagram(
 def generate_call_graph_diagram(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: _model_data_field("methods") = "",
 ) -> dict:
     """Generate a Mermaid flowchart showing the project call graph.
 
@@ -771,16 +1105,33 @@ def generate_call_graph_diagram(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional UDM JSON payload ({"methods": [{"fqn", "name",
+            "params", "cyclomatic", "parent_class"}], "edges": [...]}) to
+            render deterministically instead of scanning project_path.
     """
-    _audit("generate_call_graph_diagram", {"project_path": project_path, "output_dir": output_dir})
+    _audit("generate_call_graph_diagram", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
+    data, err = _parse_model_data(model_data, "call_graph")
+    if err:
+        return {"diagram_type": "call_graph", "format": "mermaid", "output_file": "",
+                "error": err, "lines": 0, "source": "error"}
+
     gen = _get_generator(project_path, output_dir)
-    syntax = gen.generate_call_graph_diagram()
+    if data is not None:
+        syntax = gen.generate_from_data("call_graph", data)
+        source = "model_data"
+    else:
+        syntax = gen.generate_call_graph_diagram()
+        source = "derived"
     path = gen.save_diagram(_canonical_stem("call_graph"), syntax)
     return {
         "diagram_type": "call_graph",
         "format": "mermaid",
         "output_file": path,
         "lines": len(syntax.split("\n")),
+        "source": source,
     }
 
 
@@ -796,6 +1147,21 @@ def generate_call_graph_diagram(
 def generate_all_diagrams(
     project_path: ProjectPath,
     output_dir: OutputDir = "",
+    model_data: Annotated[str, Field(
+        description=(
+            "Optional JSON object mapping diagram type slugs to UDM payloads, "
+            "e.g. {\"class\": {\"classes\": [...]}, \"deployment\": {\"nodes\": "
+            "[...]}}. Slugs present in the map are rendered deterministically "
+            "from their payload -- no AST scan or LLM call for that type; "
+            "slugs absent fall back to the existing derived/LLM path, "
+            "unchanged. A payload missing its type's primary key is rejected "
+            "for that type only (reported in model_data_errors) -- other "
+            "types in the map are unaffected. Valid slugs: class, package, "
+            "component, sequence, state, activity, deployment, usecase, "
+            "object, communication, composite, interaction, call_graph. "
+            "Max 512 KB total."
+        )
+    )] = "",
 ) -> dict:
     """Generate all applicable UML diagrams for a project.
 
@@ -808,16 +1174,75 @@ def generate_all_diagrams(
     Args:
         project_path: Root path of the project to analyze.
         output_dir: Output directory relative to project root.
+        model_data: Optional per-type UDM payload map. See parameter
+            description for shape.
     """
-    _audit("generate_all_diagrams", {"project_path": project_path, "output_dir": output_dir})
-    gen = _get_generator(project_path, output_dir)
+    _audit("generate_all_diagrams", {
+        "project_path": project_path, "output_dir": output_dir,
+        "model_data_bytes": len(model_data or ""),
+    })
 
+    model_data_map = {}
+    model_data_errors = {}
+    if model_data and model_data.strip():
+        if len(model_data.encode("utf-8")) > _MAX_MODEL_DATA_BYTES:
+            return {
+                "diagrams_generated": 0, "diagrams": [], "diagrams_failed": 0,
+                "failed": [], "model_data_errors": {},
+                "error": "model_data exceeds %d KB limit; set UML_MAX_MODEL_DATA_KB to raise it" % (_MAX_MODEL_DATA_BYTES // 1024),
+            }
+        try:
+            parsed = _json.loads(model_data)
+        except _json.JSONDecodeError as exc:
+            return {
+                "diagrams_generated": 0, "diagrams": [], "diagrams_failed": 0,
+                "failed": [], "model_data_errors": {},
+                "error": "model_data is not valid JSON: %s at line %d column %d" % (exc.msg, exc.lineno, exc.colno),
+            }
+        if not isinstance(parsed, dict):
+            return {
+                "diagrams_generated": 0, "diagrams": [], "diagrams_failed": 0,
+                "failed": [], "model_data_errors": {},
+                "error": "model_data must be a JSON object mapping diagram type slugs to payloads",
+            }
+
+        try:
+            from langgraph_engine.uml_generators import UDM_PRIMARY_KEY
+        except ImportError:
+            UDM_PRIMARY_KEY = {}
+
+        for slug, payload in parsed.items():
+            if slug not in UDM_PRIMARY_KEY:
+                model_data_errors[slug] = "unknown diagram type slug: %s" % slug
+                continue
+            if not isinstance(payload, dict):
+                model_data_errors[slug] = "payload must be a JSON object, got %s" % type(payload).__name__
+                continue
+            primary_key = UDM_PRIMARY_KEY[slug]
+            if not payload.get(primary_key):
+                model_data_errors[slug] = "must contain a non-empty '%s' list" % primary_key
+                continue
+            model_data_map[slug] = payload
+
+    gen = _get_generator(project_path, output_dir)
     gen.output_dir.mkdir(parents=True, exist_ok=True)
 
     results = gen.generate_all()
+    sources = {name: "derived" for name in results}
+
+    for slug, payload in model_data_map.items():
+        engine_key = _SLUG_TO_ENGINE_KEY.get(slug)
+        if not engine_key:
+            continue
+        try:
+            results[engine_key] = gen.generate_from_data(slug, payload)
+            sources[engine_key] = "model_data"
+        except Exception as exc:
+            model_data_errors[slug] = str(exc)
 
     try:
         results["timing-diagram"] = gen.generate_timing_diagram()
+        sources["timing-diagram"] = "derived"
     except Exception as exc:
         _LOG.warning("timing-diagram generation failed: %s: %s", type(exc).__name__, exc)
 
@@ -835,13 +1260,14 @@ def generate_all_diagrams(
                 {"name": stem, "error": str(exc), "error_type": type(exc).__name__}
             )
             continue
-        saved.append({"name": stem, "file": path})
+        saved.append({"name": stem, "file": path, "source": sources.get(name, "derived")})
 
     return {
         "diagrams_generated": len(saved),
         "diagrams": saved,
         "diagrams_failed": len(failed),
         "failed": failed,
+        "model_data_errors": model_data_errors,
         "output_dir": str(gen.output_dir),
     }
 
