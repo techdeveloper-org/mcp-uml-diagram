@@ -377,7 +377,7 @@ def generate_class_diagram(
     """Generate a UML class diagram from Python AST analysis.
 
     Produces Mermaid classDiagram syntax showing classes, attributes,
-    methods, and inheritance. Saved to docs/uml/class-diagram.md.
+    methods, and inheritance. Written to the resolved output directory as class_diagram.md (default: uml/ at the project root)..
     System prompt enriched with Domain 46 uml-class-diagram-core when
     GLOBAL_LIBRARY_PATH is configured.
 
@@ -410,7 +410,7 @@ def generate_package_diagram(
     """Generate a UML package diagram from module import analysis.
 
     Produces Mermaid flowchart showing module dependencies.
-    Saved to docs/uml/package-diagram.md.
+    Written to the resolved output directory as package_diagram.md (default: uml/ at the project root)..
 
     Args:
         project_path: Root path of the project to analyze.
@@ -440,7 +440,7 @@ def generate_component_diagram(
     """Generate a UML component diagram from project structure.
 
     Produces Mermaid flowchart with subgraphs representing components.
-    Saved to docs/uml/component-diagram.md.
+    Written to the resolved output directory as component_diagram.md (default: uml/ at the project root)..
 
     Args:
         project_path: Root path of the project to analyze.
