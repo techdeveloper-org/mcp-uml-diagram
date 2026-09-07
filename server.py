@@ -651,8 +651,13 @@ def generate_sequence_diagram(
 ) -> dict:
     """Generate a UML sequence diagram from call chain analysis.
 
-    Uses AST to extract call chains and optionally LLM to enrich labels.
-    Produces Mermaid sequenceDiagram syntax.
+    Purely AST-derived: entry_function, when given, is a real filter
+    (BFS on caller->callee reachability from that function), not an LLM
+    enrichment hint - issue #312 found this parameter used to be passed
+    into an `_llm_enrich()` call under the name `context`, silently
+    replacing the deterministic rendering with LLM output whenever it
+    was non-empty, despite this tool's Tier 2 AST labelling. Produces
+    Mermaid sequenceDiagram syntax.
 
     Args:
         project_path: Root path of the project to analyze.
@@ -676,7 +681,7 @@ def generate_sequence_diagram(
         syntax = gen.generate_from_data("sequence", data)
         source = "model_data"
     else:
-        syntax = gen.generate_sequence_diagram(context=entry_function)
+        syntax = gen.generate_sequence_diagram(entry_function=entry_function)
         source = "derived"
     path = gen.save_diagram(_canonical_stem("sequence"), syntax)
     return {
