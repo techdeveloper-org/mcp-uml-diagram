@@ -455,12 +455,27 @@ def _generate_uml_from_code(self, source_code, language="python"):
 
     id_map = {}  # type: Dict[str, str]
     for cls in classes:
+        if isinstance(cls, str):
+            name = cls
+            lines.append("    class %s" % name)
+            continue
+            
         name = cls.get("name", "Unknown")
         id_map[name] = name
         lines.append("    class %s {" % name)
+        
         for attr in cls.get("attributes", [])[:8]:
-            lines.append("        +%s" % attr)
+            if isinstance(attr, str):
+                lines.append("        +%s" % attr)
+            else:
+                attr_name = attr.get("name", "attr")
+                lines.append("        +%s" % attr_name)
+                
         for meth in cls.get("methods", [])[:12]:
+            if isinstance(meth, str):
+                lines.append("        +%s()" % meth)
+                continue
+                
             vis = meth.get("visibility", "+")
             fn = meth.get("name", "method")
             params = ", ".join(meth.get("params", [])[:4])
